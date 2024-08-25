@@ -19,9 +19,18 @@ from Crypto.Hash import SHA256
 from base64 import b64encode
 
 from .dbus import X1PlusDBusService
-from x1plus.utils import get_MAC, get_IP, serial_number, is_emulating
+from x1plus.utils import get_MAC, get_IP, is_emulating
+from x1plus.utils import serial_number as utils_sn
 
 logger = logging.getLogger(__name__)
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s [%(levelname)s] %(message)s",
+#     handlers=[
+#         logging.FileHandler("/var/log/polar_debug.log"),
+#         logging.StreamHandler(),
+#     ]
+# )
 
 POLAR_INTERFACE = "x1plus.polar"
 POLAR_PATH = "/x1plus/polar"
@@ -38,7 +47,7 @@ class PolarPrintService(X1PlusDBusService):
         The MAC is stored here, but on restart will always generated dynamically
         in an attempt to discourage movement of SD cards.
         """
-        logger.info("Polar cloud initing.")
+        logger.info("Polar __init__.")
         self.daemon = daemon
         self.mac = ""
         # The username can be stored in non-volatile memory, but the PIN must be
@@ -76,22 +85,27 @@ class PolarPrintService(X1PlusDBusService):
         # self.daemon.settings.on("self.pin", self.set_pin())
         self.socket = None
         super().__init__(router=router, dbus_interface=POLAR_INTERFACE, dbus_path=POLAR_PATH, **kwargs)
-        logger.info("Polar cloud inited")
 
     async def task(self) -> None:
         """Create Socket.IO client and connect to server."""
-        logger.info("Polar cloud task started")
-        self.socket = socketio.AsyncClient(http_session=http_session)
-        self.set_interface()
+        logger.info("Polar task")
+        # Set socketio to use Python's logger object.
+        self.socket = socketio.AsyncClient(http_session=http_session, logger=logger, engineio_logger=logger)
+        self._set_interface()
         try:
-            await self.get_creds()
+            await self._get_creds()
         except Exception as e:
-            logger.debug(f"Polar get_creds: {e}")
+            logger.debug(f"Polar _get_creds failed: {e}")
             return
-        try:
-            await self.socket.connect(self.server_url, transports=["websocket"])
-        except Exception as e:
-            logger.debug(f"Polar socket connection failed: {e}")
+        for i in range(20):
+            try:
+                await self.socket.connect(self.server_url, transports=["websocket"])
+                # logger.info(f"Polar socket connected. socket.id: {self.socket.sid}")
+                break
+            except Exception as e:
+                logger.debug(f"Polar socket connection failed: {e}")
+                time.sleep(10)
+        else:
             return
         logger.info("Polar socket created!")
         # Assign socket callbacks.
@@ -108,7 +122,7 @@ class PolarPrintService(X1PlusDBusService):
         await super().task()
         logger.info("Polar Cloud is running.")
 
-    async def unregister(self):
+    async def _unregister(self):
         """
         After a printer is deleted I'll need this in order to reregister it
         Later it'll be necessary for the interface, so I just added it now.
@@ -145,7 +159,7 @@ class PolarPrintService(X1PlusDBusService):
                 "signature": b64encode(key.sign(hashed_challenge)).decode("utf-8"),
                 "MAC": self.mac,
                 "protocol": "2.0",
-                "mfgSn": self.serial_number(),
+                "mfgSn": self._serial_number(),
                 "printerMake": "Bambu Lab X1 Carbon",
             }
             """
@@ -169,7 +183,6 @@ class PolarPrintService(X1PlusDBusService):
             # We already have a key: just register.
             # Todo: There might be a race condition here or maybe server is sending
             # a lot of welcome requests. Dealt with it by adding self.last_ping.
-            logger.info(f"_on_welcome Registering.")
             await self._register()
         else:
             # It's not possible to have a serial number and no key, so this
@@ -254,7 +267,7 @@ class PolarPrintService(X1PlusDBusService):
             "email": self.daemon.settings.get("polar.username"),
             "pin": self.pin,
             "publicKey": self.daemon.settings.get("polar.public_key"),
-            "mfgSn": self.serial_number(),
+            "mfgSn": self._serial_number(),
             "myInfo": {"MAC": self.mac},
         }
         await self.socket.emit("register", data)
@@ -331,11 +344,19 @@ class PolarPrintService(X1PlusDBusService):
                 self.status = 1
             else:
                 self.status = 3
-        elif self.status == 6:
-            await self._job("canceled")
-            self.status = 6
-        elif self.status == 7:
+        elif task_state == 4:
+            # Finished
             await self._job("completed")
+            self.status == 0
+        elif task_state == 5:
+            # Failed
+            if self.status != 0:
+                await self._job("canceled")
+                self.status = 0
+        elif task_state == 6:
+            # Paused
+            # await self._job("canceled")
+            self.status = 4
 
     async def _status(self) -> None:
         """
@@ -394,8 +415,8 @@ class PolarPrintService(X1PlusDBusService):
                     logger.debug('Polar got "/ is not a connected namespace." error.')
                     # This seems to be a python socketio bug/feature?
                     # In any case, recover by reconnecting.
-                    await self.socket.disconnect()
                     logger.info("Polar disconnecting.")
+                    await self.socket.disconnect()
                     self.is_connected = False
                     # After the next request the server will respond with `welcome`.
                     logger.info("Polar reconnecting.")
@@ -403,11 +424,6 @@ class PolarPrintService(X1PlusDBusService):
                     self.is_connected = True
                     return  # Or else we'll starting sending too many updates.
             await asyncio.sleep(10)
-            # try:
-            #     await asyncio.wait_for(self.status_task_wake.wait(), timeout=50)
-            # except TimeoutError as e:
-            #     logger.error(e)
-            # self.status_task_wake.clear()
         logger.debug("Polar status ending.")
 
     async def _on_delete(self, response, *args, **kwargs) -> None:
@@ -431,12 +447,13 @@ class PolarPrintService(X1PlusDBusService):
             await self.socket.disconnect()
             self.is_connected = False
 
-    async def get_creds(self) -> None:
+    async def _get_creds(self) -> None:
         """
         If PIN and username are not set, open Polar Cloud interface window and
         get them.
         Todo: This works only during emulation.
         """
+        logger.info("Polar _get_creds")
         if is_emulating():
             # I need to use actual account creds to connect, so we're using .env
             # for testing, until there's an interface.
@@ -454,6 +471,7 @@ class PolarPrintService(X1PlusDBusService):
             if not self.daemon.settings.get("polar.username", ""):
                 # Get it from the interface.
                 pass
+        # For now must use .env. eventually kill this.
         with open(env_file) as env:
             for line in env.readlines():
                 k, v = line.strip().split("=")
@@ -505,25 +523,7 @@ class PolarPrintService(X1PlusDBusService):
             file_name += ".gcode"
         await self._download_file(path, file_name, data["gcodeFile"])
         location = os.path.join(path, file_name)
-        printer_action("print", location)
-
-        # self.job_id = "123"
-
-    # def _print_file(self, path, file_name):
-    #     logger.info(f"_print_file {location}")
-    #     location = os.path.join(path, file_name)
-    #     printer_action("print", location)
-    #     dbus_call = [
-    #         "dbus-send",
-    #         "--system",
-    #         "--print-reply",
-    #         "--dest=bbl.service.screen",
-    #         "/bbl/service/screen",
-    #         "bbl.screen.x1plus.printGcodeFile",
-    #         ('string: {"filePath": ' f'"{location}"' "}"),
-    #     ]
-    #     done = subprocess.run(dbus_call, capture_output=True).stdout.strip()
-    #     logger.info(done)
+        self._printer_action("gcode_file", location)
 
     async def _download_file(self, path, file, url):
         """Adapted/stolen from ota.py. Maybe could move to utils?"""
@@ -531,14 +531,14 @@ class PolarPrintService(X1PlusDBusService):
             try:
                 os.mkdir(path)
             except:
-                logger.info(f"Polar _download_file. {path} already exists.")
+                logger.error(f"Polar _download_file. {path} already exists.")
             dest = os.path.join(path, file)
             logger.info("Polar _download_file")
             logger.debug(f"Polar downloading {url} to {dest}")
             download_bytes = 0
             download_bytes_total = -1
             with open(dest, "wb") as f:
-                logger.debug("Polar opened file to write.")
+                logger.info("Polar opened file to write.")
                 timeout = aiohttp.ClientTimeout(connect=5, total=900, sock_read=10)
                 async with aiohttp.ClientSession(
                     connector=aiohttp.TCPConnector(ssl=ssl_ctx), timeout=timeout
@@ -565,18 +565,20 @@ class PolarPrintService(X1PlusDBusService):
 
     async def _on_pause(self, data, *args, **kwargs) -> None:
         logger.info("Polar _on_pause")
-        printer_action("stop")
+        self._printer_action("pause")
 
     async def _on_resume(self, data, *args, **kwargs) -> None:
         logger.info("Polar _on_resume")
-        printer_action("resume")
+        self._printer_action("resume")
 
     async def _on_cancel(self, data, *args, **kwargs) -> None:
         logger.info("Polar _on_cancel")
-        printer_action("stop")
+        self._printer_action("stop")
 
-    def printer_action(self, which_action, print_file="") -> None:
+    def _printer_action(self, which_action, print_file="") -> None:
         """Make dbus call to print, pause, cancel, resume."""
+        logger.info(f"Polar _printer_action {which_action} {print_file}")
+        logger.debug(f'Polar dbus json string: string: \'{{"filePath": "{print_file}", "action": "{which_action}"}}\'')
         dbus_call = [
             "dbus-send",
             "--system",
@@ -584,25 +586,28 @@ class PolarPrintService(X1PlusDBusService):
             "--dest=bbl.service.screen",
             "/bbl/service/screen",
             "bbl.screen.x1plus.polarPrint",
-            ('string: {"filePath": ' f'"{location}"", "action": "{which_action}"' "}"),
+            f'string: {{"filePath": "{print_file}", "action": "{which_action}"}}',
         ]
         done = subprocess.run(dbus_call, capture_output=True).stdout.strip()
-        logger.info(done)
+        logger.debug(done)
 
-    def set_interface(self) -> None:
+    def _set_interface(self) -> None:
         """
         Get IP and MAC addresses and store them in self.settings. This is
         intentionally dynamic as a security measure.
         """
+        logger.info("Polar _set_interface")
         self.mac = get_MAC()
         self.ip = get_IP()
+        logger.debug(f"Polar MAC: {self.mac} IP: {self.ip}")
 
-    def serial_number(self) -> str:
+    def _serial_number(self) -> str:
         """
         Return the Bambu serial number—NOT the Polar Cloud SN. If emulating,
         random string.
         """
+        logger.info("Polar _serial_number")
         if is_emulating:
             return "123456789"
         else:
-            return serial_number()
+            return utils_sn()

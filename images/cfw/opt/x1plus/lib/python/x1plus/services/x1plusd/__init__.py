@@ -11,6 +11,7 @@ from .httpd import HTTPService
 from .mqtt import MQTTClient
 from .expansion import ExpansionManager
 from .sensors import SensorsService
+from .polar_cloud import PolarPrintService
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,7 @@ class X1PlusDaemon:
         self.httpd = HTTPService(router=self.router, daemon=self)
         self.sensors = SensorsService(router=self.router, daemon=self)
         self.expansion = ExpansionManager(router=self.router, daemon=self)
-
-        from .polar_cloud import PolarPrintService
         self.polar_cloud = PolarPrintService(router=self.router, daemon=self)
-        logger.info("PolarPrintService object created.")
 
         return self
 
@@ -43,7 +41,6 @@ class X1PlusDaemon:
         asyncio.create_task(self.httpd.task())
         asyncio.create_task(self.sensors.task())
         asyncio.create_task(self.expansion.task())
-        logger.info("Polar is attempting to start.")
         asyncio.create_task(self.polar_cloud.task())
 
         logger.info("x1plusd is running")

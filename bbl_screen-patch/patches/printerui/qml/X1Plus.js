@@ -206,8 +206,8 @@ X1Plus.DBus.registerMethod("printGcodeFile", (param) => {
 });
 X1Plus.DBus.registerMethod("polarPrint", (param) => {
 	DDS.publish("device/request/print", { "sequence_id": "0", "command": param["action"], "param": param["filePath"] });
-	console.log("[x1p] Print:" + param["action"] + ": ", JSON.stringify(payload));
-	param["finished"] = "Print" + param["action"] + ".";
+	console.log("[x1p] Print:" + param["action"] + ": ");
+	param["finished"] = "Print " + param["action"] + ".";
 	return param;
 });
 // X1Plus.DBus.registerMethod("pausePrint", (param) => {
