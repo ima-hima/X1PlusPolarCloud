@@ -3,24 +3,25 @@ Module to allow printing using Polar Cloud service.
 """
 
 import asyncio
-import aiohttp
 import datetime
 import logging
 import os
-import socketio
 import ssl
 import subprocess
 import time
+from base64 import b64encode
 from json import dumps, loads
-from jeepney import DBusAddress, new_method_call, MessageType
+
+import aiohttp
+import socketio
+from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
-from Crypto.Hash import SHA256
-from base64 import b64encode
+from jeepney import DBusAddress, MessageType, new_method_call
+from x1plus.utils import get_IP, get_MAC, is_emulating
+from x1plus.utils import serial_number as utils_sn
 
 from .dbus import X1PlusDBusService
-from x1plus.utils import get_MAC, get_IP, is_emulating
-from x1plus.utils import serial_number as utils_sn
 
 logger = logging.getLogger(__name__)
 # logging.basicConfig(
@@ -59,7 +60,7 @@ class PolarPrintService(X1PlusDBusService):
         self.server_url = "https://printer2.polar3d.com"
         self.socket = None
         self.status = 0  # Idle
-        self.job_id = "123" # Defaults to serial if Polar Cloud hasn't sent anything.
+        self.job_id = "123"  # Defaults to serial if Polar Cloud hasn't sent anything.
         self.temps = {}  # Will hold six temp values. Set in _status_update().
         """
         self.downloading will allow me to update status when printer doesn't realize
@@ -84,13 +85,20 @@ class PolarPrintService(X1PlusDBusService):
         # self.daemon.settings.on("polarprint.enabled", self.sync_startstop())
         # self.daemon.settings.on("self.pin", self.set_pin())
         self.socket = None
-        super().__init__(router=router, dbus_interface=POLAR_INTERFACE, dbus_path=POLAR_PATH, **kwargs)
+        super().__init__(
+            router=router,
+            dbus_interface=POLAR_INTERFACE,
+            dbus_path=POLAR_PATH,
+            **kwargs,
+        )
 
     async def task(self) -> None:
         """Create Socket.IO client and connect to server."""
         logger.info("Polar task")
         # Set socketio to use Python's logger object.
-        self.socket = socketio.AsyncClient(http_session=http_session, logger=logger, engineio_logger=logger)
+        self.socket = socketio.AsyncClient(
+            http_session=http_session, logger=logger, engineio_logger=logger
+        )
         self._set_interface()
         try:
             await self._get_creds()
@@ -407,7 +415,9 @@ class PolarPrintService(X1PlusDBusService):
             }
             try:
                 await self.socket.emit("status", data)
-                logger.info(f"Polar status update {self.status} {datetime.datetime.now()}")
+                logger.info(
+                    f"Polar status update {self.status} {datetime.datetime.now()}"
+                )
                 self.last_ping = datetime.datetime.now()
             except Exception as e:
                 logger.error(f"emit status failed: {e}")
@@ -578,7 +588,9 @@ class PolarPrintService(X1PlusDBusService):
     def _printer_action(self, which_action, print_file="") -> None:
         """Make dbus call to print, pause, cancel, resume."""
         logger.info(f"Polar _printer_action {which_action} {print_file}")
-        logger.debug(f'Polar dbus json string: string: \'{{"filePath": "{print_file}", "action": "{which_action}"}}\'')
+        logger.debug(
+            f'Polar dbus json string: string: \'{{"filePath": "{print_file}", "action": "{which_action}"}}\''
+        )
         dbus_call = [
             "dbus-send",
             "--system",

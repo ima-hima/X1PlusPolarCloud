@@ -15,6 +15,7 @@ from .polar_cloud import PolarPrintService
 
 logger = logging.getLogger(__name__)
 
+
 class X1PlusDaemon:
     @classmethod
     async def create(cls):
