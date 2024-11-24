@@ -334,251 +334,7 @@ class PolarPrintService(X1PlusDBusService):
         }
         await self.socket.emit("register", data)
 
-    async def _status_update(self):
-        """
-        Translate status code from printer into status code to return. Set
-        self.status appropriately.
 
-        Codes from the printer:
-        TaskStage: We'll ignore this; just here for completeness.
-          0: INITING
-          1: WAITING
-          2: WORKING
-          3: PAUSED
-        TaskState
-          0: IDLE
-          1: SLICING
-          2: PREPARE
-          3: RUNNING
-          4: FINISH
-          5: FAILED
-          6: PAUSE
-
-        Codes to return to the server:
-        0   Ready; printer is idle and ready to print
-        1   Serial; printer is printing a local print over its serial connection
-        2   Preparing; printer is preparing a cloud print (e.g., slicing)
-        3   Printing; printer is printing a cloud print
-        4   Paused; printer has paused a print
-        5   Postprocessing; printer is performing post-printing operations
-        6   Canceling; printer is canceling a print from the cloud
-        7   Complete; printer has completed a print job from the cloud
-        8   Updating; printer is updating its software
-        9   Cold pause; printer is in a "cold pause" state
-        10  Changing filament; printer is in a "change filament" state
-        11  TCP/IP; printer is printing a local print over a TCP/IP connection
-        12  Error; printer is in an error state
-        13  Disconnected; controller's USB is disconnected from the printer
-        14  Door open; unable to start or resume a print
-        15  Clear build plate; unable to start a new print
-
-        For now, states 5, 6, 8, 9, 10, 11, 13, 14, and 15 will be ignored.
-        There's no equivalent to "canceling", so forget 6.
-        11 is the same as 1
-        TODO: 14 should soon be capturable?
-        TODO: 15 **really, really** needs to be dealt with.
-
-        When a print is cancelled it goes to FAILED or if there's an error we'll
-        report an error for 2 mins. then return to IDLE.
-
-        Likewise, FINISHED returns to IDLE after two mins.
-        """
-        prev_status = self.status
-        task_state = self.daemon.mqtt.latest_print_status.get("gcode_state", "IDLE")
-        # task_stage = self.daemon.mqtt.latest_print_status.get("mc_print_stage", "0")
-        # logger.debug(f"Polar  *** job id: {self.job_id}, status: {task_state}")
-        logger.info(
-            f"Polar prev status: {self.status}; "
-            f"task_state: {task_state}; "
-            f"time finished: {datetime.datetime.now() - self.time_finished}"
-        )
-        # Note we don't change self.status until after we've determined the printer
-        # state because we're tracking the previous status.
-        match self.status_lookup[task_state]:
-            case 0: # IDLE
-                if self.status != 0:
-                    logger.info(
-                        f"Polar calling _job; prev status: {self.status}; "
-                        f"task_state: {task_state}"
-                    )
-                    await self._job("completed")
-                self.status == 0
-            case 1 | 2 | 3: # SLICING, PREPARING, RUNNING
-                # Printing or preparing
-                if self.job_id in {"0", "123"}:
-                    """
-                    This is a local job.
-                    _on_print() sets job_id to BAMBUxxxx. If it wasn't set, then
-                    it's a local job. Set job_id to "123" bc eventually _job() will
-                    need to send back a job_id. job_id will be reset to "0" in _job().
-                    """
-                    self.status = 1  # Local print
-                    self.job_id = "123"
-                else:
-                    self.status = 3  # Cloud print
-            case 4: # FINISHING
-                # Printer is paused.
-                self.status = 4
-            case 7 | 12: # FINISH, FAIL
-                if self.status not in {0, 6, 7, 12}:
-                    # We just switched to an error or finished state from printing.
-                    # Recall the error could be from cancelling, in which case
-                    # status 6 is set in `_cancel()`.
-                    # In that case track when we made the switch.
-                    # Switch status to match current.
-                    # Note that 0 is a special case, where we're reporting IDLE
-                    # but the printer thinks it's failed.
-                    self.time_finished = datetime.datetime.now()
-                    self.status = self.status_lookup[task_state]
-                    logger.info(
-                        "Polar: just switched to failed. "
-                        f"{self.time_finished}"
-                    )
-                elif (
-                    self.status in {6, 7, 12}
-                    and datetime.datetime.now() - self.time_finished
-                    > datetime.timedelta(seconds=120)
-                ):
-                    # We've been in an error or finished state for two mins. Send
-                    # job completed and switch status to idle.
-                    logger.info(
-                        "Polar: end failed state. "
-                        f"{datetime.datetime.now() - self.time_finished}"
-                    )
-                    self.status = 0
-                    await self._job("completed")
-                elif self.status == 0:
-                    # Printer has been returning IDLE even though its internal
-                    # state is FAILED or FINISHED. Remain in IDLE.
-                    if self.status_lookup[task_state] == 7:
-                        logger.info("Polar: printer in FINISHED; remain in IDLE.")
-                    else:
-                        logger.info("Polar: printer in FAILED; remain in IDLE.")
-                # Do nothing if we're in 6, 7, or 12 and time isn't yet elapsed.
-
-    async def _status(self) -> None:
-        """
-        Send a status message every 10 seconds when printing. Also trigger
-        sending of image every 20 seconds.
-
-        All fields but serialNumber and status are optional.
-        {
-            "serialNumber": "string",
-            "status": integer,
-            "progress": "string",
-            "progressDetail": "string",
-            "estimatedTime": integer,
-            "filamentUsed": integer,
-            "startTime": "string",
-            "printSeconds": integer,
-            "bytesRead": integer,
-            "fileSize": integer,
-            "tool0": floating-point,
-            "tool1": floating-point,
-            "bed": floating-point,
-            "chamber": floating-point,
-            "targetTool0": floating-point,
-            "targetTool1": floating-point,
-            "targetBed": floating-point,
-            "targetChamber": floating-point,
-            "door": integer,
-            "jobId": "string",
-            "file": "string",
-            "config": "string"
-        }
-        """
-        capture_image = True
-        while True:
-            await self._status_update()
-            if not self.is_connected:
-                return
-            if self.daemon.mqtt.latest_print_status.get("mc_percent", 0) < 5:
-                # At this point we can guess the total print time. It'll possibly
-                # be off by a little. But the mqtt doesn't have a value for total
-                # time that I can find.
-                self.estimated_print_time = self.daemon.mqtt.latest_print_status.get(
-                    "mc_remaining_time", 0
-                )
-            # Notes: The logic around time is complicated. Maybe I should move
-            # this to another fn? All these weird things that rely on the status
-            # bug me. There's got to be a better way.
-            time_used = datetime.datetime.now() - self.start_time
-            if self.status == 0:
-                # In this case there's no print so these numbers should be reset.
-                self.estimated_print_time = 0
-                self.start_time = datetime.datetime.now()
-                time_used = datetime.timedelta(seconds=0)
-            if (datetime.datetime.now() - self.last_ping).total_seconds() <= 5:
-                # Don't do extra status updates.
-                return
-            data = {
-                "tool0": self.daemon.mqtt.latest_print_status.get("nozzle_temper", 0),
-                "bed": self.daemon.mqtt.latest_print_status.get("bed_temper", 0),
-                "chamber": self.daemon.mqtt.latest_print_status.get(
-                    "chamber_temper", 0
-                ),
-                "targetTool0": self.daemon.mqtt.latest_print_status.get(
-                    "nozzle_target_temper", 0
-                ),
-                "targetBed": self.daemon.mqtt.latest_print_status.get(
-                    "bed_target_temper", 0
-                ),
-                # TODO: targetChamber isn't in mqtt?
-                # "targetChamber": self.daemon.mqtt.latest_print_status.get("", "0"),
-                "serialNumber": self.daemon.settings.get("polar.sn"),
-                "status": self.status,
-                "startTime": self.start_time.isoformat(),
-                "estimatedTime": int(self.estimated_print_time) * 60,
-                "printSeconds": time_used.total_seconds(),
-                "progressDetail": (
-                    f"Printing Job: {self.file_name} "
-                    "Percent Complete: "
-                    f"{self.daemon.mqtt.latest_print_status.get('mc_percent', 0)}%"
-                ),
-            }
-            try:
-                await self.socket.emit("status", data)
-                # logger.info(
-                #     f"Polar status update {self.status} {datetime.datetime.now()}"
-                # )
-                self.last_ping = datetime.datetime.now()
-
-                if capture_image:
-                    # Capture and upload a new image every other status update.
-                    cam = AioRtspReceiver()
-                    jpeg = await cam.receive_jpeg()
-                    if self.status in [0, 8, 9, 10, 15]:
-                        # In these cases send idle image.
-                        # (TODO: are these all the cases for idle?)
-                        await self._upload_jpeg("idle", jpeg)
-                    elif self.status != 11:
-                        await self._upload_jpeg("printing", jpeg)
-                # Next time through loop it will capture (or not).
-                capture_image = not capture_image
-
-            except Exception as e:
-                logger.error(f"emit status failed: \x1b[31;1m{e}\x1b[0m")
-                if str(e) == "/ is not a connected namespace.":
-                    # This seems to be a python socketio bug/feature?
-                    # In any case, recover by reconnecting.
-                    logger.info("Polar disconnecting.")
-                    await self.socket.disconnect()
-                    self.is_connected = False
-                    # After the next request the server will respond with `welcome`.
-                    logger.info("Polar reconnecting.")
-                    await self.socket.connect(
-                        self.server_url,
-                        transports=["websocket"],
-                        wait_timeout=10
-                    )
-                    self.is_connected = True
-                    return  # Or else we'll starting sending too many updates.
-            if self.status != "0":
-                await asyncio.sleep(10)
-            else:
-                # Longer pause when idle.
-                await asyncio.sleep(30)
-        logger.debug("Polar status ending.")
 
     async def _upload_jpeg(self, which_state, jpeg) -> None:
         """
@@ -897,3 +653,255 @@ class PolarPrintService(X1PlusDBusService):
             return "123456789"
         else:
             return utils_sn()
+
+
+class statusUpdater():
+    def __init__(self):
+        self.status
+        self.status_lookup
+
+    async def _status_update(self):
+        """
+        Translate status code from printer into status code to return. Set
+        self.status appropriately.
+
+        Codes from the printer:
+        TaskStage: We'll ignore this; just here for completeness.
+          0: INITING
+          1: WAITING
+          2: WORKING
+          3: PAUSED
+        TaskState
+          0: IDLE
+          1: SLICING
+          2: PREPARE
+          3: RUNNING
+          4: FINISH
+          5: FAILED
+          6: PAUSE
+
+        Codes to return to the server:
+        0   Ready; printer is idle and ready to print
+        1   Serial; printer is printing a local print over its serial connection
+        2   Preparing; printer is preparing a cloud print (e.g., slicing)
+        3   Printing; printer is printing a cloud print
+        4   Paused; printer has paused a print
+        5   Postprocessing; printer is performing post-printing operations
+        6   Canceling; printer is canceling a print from the cloud
+        7   Complete; printer has completed a print job from the cloud
+        8   Updating; printer is updating its software
+        9   Cold pause; printer is in a "cold pause" state
+        10  Changing filament; printer is in a "change filament" state
+        11  TCP/IP; printer is printing a local print over a TCP/IP connection
+        12  Error; printer is in an error state
+        13  Disconnected; controller's USB is disconnected from the printer
+        14  Door open; unable to start or resume a print
+        15  Clear build plate; unable to start a new print
+
+        For now, states 5, 6, 8, 9, 10, 11, 13, 14, and 15 will be ignored.
+        There's no equivalent to "canceling", so forget 6.
+        11 is the same as 1
+        TODO: 14 should soon be capturable?
+        TODO: 15 **really, really** needs to be dealt with.
+
+        When a print is cancelled it goes to FAILED or if there's an error we'll
+        report an error for 2 mins. then return to IDLE.
+
+        Likewise, FINISHED returns to IDLE after two mins.
+        """
+        prev_status = self.status
+        task_state = self.daemon.mqtt.latest_print_status.get("gcode_state", "IDLE")
+        # task_stage = self.daemon.mqtt.latest_print_status.get("mc_print_stage", "0")
+        # logger.debug(f"Polar  *** job id: {self.job_id}, status: {task_state}")
+        logger.info(
+            f"Polar prev status: {self.status}; "
+            f"task_state: {task_state}; "
+            f"time finished: {datetime.datetime.now() - self.time_finished}"
+        )
+        # Note we don't change self.status until after we've determined the printer
+        # state because we're tracking the previous status.
+        match self.status_lookup[task_state]:
+            case 0: # IDLE
+                if self.status != 0:
+                    logger.info(
+                        f"Polar calling _job; prev status: {self.status}; "
+                        f"task_state: {task_state}"
+                    )
+                    await self._job("completed")
+                self.status == 0
+            case 1 | 2 | 3: # SLICING, PREPARING, RUNNING
+                # Printing or preparing
+                if self.job_id in {"0", "123"}:
+                    """
+                    This is a local job.
+                    _on_print() sets job_id to BAMBUxxxx. If it wasn't set, then
+                    it's a local job. Set job_id to "123" bc eventually _job() will
+                    need to send back a job_id. job_id will be reset to "0" in _job().
+                    """
+                    self.status = 1  # Local print
+                    self.job_id = "123"
+                else:
+                    self.status = 3  # Cloud print
+            case 4: # FINISHING
+                # Printer is paused.
+                self.status = 4
+            case 7 | 12: # FINISH, FAIL
+                if self.status not in {0, 6, 7, 12}:
+                    # We just switched to an error or finished state from printing.
+                    # Recall the error could be from cancelling, in which case
+                    # status 6 is set in `_cancel()`.
+                    # In that case track when we made the switch.
+                    # Switch status to match current.
+                    # Note that 0 is a special case, where we're reporting IDLE
+                    # but the printer thinks it's failed.
+                    self.time_finished = datetime.datetime.now()
+                    self.status = self.status_lookup[task_state]
+                    logger.info(
+                        "Polar: just switched to failed. "
+                        f"{self.time_finished}"
+                    )
+                elif (
+                    self.status in {6, 7, 12}
+                    and datetime.datetime.now() - self.time_finished
+                    > datetime.timedelta(seconds=120)
+                ):
+                    # We've been in an error or finished state for two mins. Send
+                    # job completed and switch status to idle.
+                    logger.info(
+                        "Polar: end failed state. "
+                        f"{datetime.datetime.now() - self.time_finished}"
+                    )
+                    self.status = 0
+                    await self._job("completed")
+                elif self.status == 0:
+                    # Printer has been returning IDLE even though its internal
+                    # state is FAILED or FINISHED. Remain in IDLE.
+                    if self.status_lookup[task_state] == 7:
+                        logger.info("Polar: printer in FINISHED; remain in IDLE.")
+                    else:
+                        logger.info("Polar: printer in FAILED; remain in IDLE.")
+                # Do nothing if we're in 6, 7, or 12 and time isn't yet elapsed.
+
+    async def _status(self) -> None:
+        """
+        Send a status message every 10 seconds when printing. Also trigger
+        sending of image every 20 seconds.
+
+        All fields but serialNumber and status are optional.
+        {
+            "serialNumber": "string",
+            "status": integer,
+            "progress": "string",
+            "progressDetail": "string",
+            "estimatedTime": integer,
+            "filamentUsed": integer,
+            "startTime": "string",
+            "printSeconds": integer,
+            "bytesRead": integer,
+            "fileSize": integer,
+            "tool0": floating-point,
+            "tool1": floating-point,
+            "bed": floating-point,
+            "chamber": floating-point,
+            "targetTool0": floating-point,
+            "targetTool1": floating-point,
+            "targetBed": floating-point,
+            "targetChamber": floating-point,
+            "door": integer,
+            "jobId": "string",
+            "file": "string",
+            "config": "string"
+        }
+        """
+        capture_image = True
+        while True:
+            await self._status_update()
+            if not self.is_connected:
+                return
+            if self.daemon.mqtt.latest_print_status.get("mc_percent", 0) < 5:
+                # At this point we can guess the total print time. It'll possibly
+                # be off by a little. But the mqtt doesn't have a value for total
+                # time that I can find.
+                self.estimated_print_time = self.daemon.mqtt.latest_print_status.get(
+                    "mc_remaining_time", 0
+                )
+            # Notes: The logic around time is complicated. Maybe I should move
+            # this to another fn? All these weird things that rely on the status
+            # bug me. There's got to be a better way.
+            time_used = datetime.datetime.now() - self.start_time
+            if self.status == 0:
+                # In this case there's no print so these numbers should be reset.
+                self.estimated_print_time = 0
+                self.start_time = datetime.datetime.now()
+                time_used = datetime.timedelta(seconds=0)
+            if (datetime.datetime.now() - self.last_ping).total_seconds() <= 5:
+                # Don't do extra status updates.
+                return
+            data = {
+                "tool0": self.daemon.mqtt.latest_print_status.get("nozzle_temper", 0),
+                "bed": self.daemon.mqtt.latest_print_status.get("bed_temper", 0),
+                "chamber": self.daemon.mqtt.latest_print_status.get(
+                    "chamber_temper", 0
+                ),
+                "targetTool0": self.daemon.mqtt.latest_print_status.get(
+                    "nozzle_target_temper", 0
+                ),
+                "targetBed": self.daemon.mqtt.latest_print_status.get(
+                    "bed_target_temper", 0
+                ),
+                # TODO: targetChamber isn't in mqtt?
+                # "targetChamber": self.daemon.mqtt.latest_print_status.get("", "0"),
+                "serialNumber": self.daemon.settings.get("polar.sn"),
+                "status": self.status,
+                "startTime": self.start_time.isoformat(),
+                "estimatedTime": int(self.estimated_print_time) * 60,
+                "printSeconds": time_used.total_seconds(),
+                "progressDetail": (
+                    f"Printing Job: {self.file_name} "
+                    "Percent Complete: "
+                    f"{self.daemon.mqtt.latest_print_status.get('mc_percent', 0)}%"
+                ),
+            }
+            try:
+                await self.socket.emit("status", data)
+                # logger.info(
+                #     f"Polar status update {self.status} {datetime.datetime.now()}"
+                # )
+                self.last_ping = datetime.datetime.now()
+
+                if capture_image:
+                    # Capture and upload a new image every other status update.
+                    cam = AioRtspReceiver()
+                    jpeg = await cam.receive_jpeg()
+                    if self.status in [0, 8, 9, 10, 15]:
+                        # In these cases send idle image.
+                        # (TODO: are these all the cases for idle?)
+                        await self._upload_jpeg("idle", jpeg)
+                    elif self.status != 11:
+                        await self._upload_jpeg("printing", jpeg)
+                # Next time through loop it will capture (or not).
+                capture_image = not capture_image
+
+            except Exception as e:
+                logger.error(f"emit status failed: \x1b[31;1m{e}\x1b[0m")
+                if str(e) == "/ is not a connected namespace.":
+                    # This seems to be a python socketio bug/feature?
+                    # In any case, recover by reconnecting.
+                    logger.info("Polar disconnecting.")
+                    await self.socket.disconnect()
+                    self.is_connected = False
+                    # After the next request the server will respond with `welcome`.
+                    logger.info("Polar reconnecting.")
+                    await self.socket.connect(
+                        self.server_url,
+                        transports=["websocket"],
+                        wait_timeout=10
+                    )
+                    self.is_connected = True
+                    return  # Or else we'll starting sending too many updates.
+            if self.status != "0":
+                await asyncio.sleep(10)
+            else:
+                # Longer pause when idle.
+                await asyncio.sleep(30)
+        logger.debug("Polar status ending.")
